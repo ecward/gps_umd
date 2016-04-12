@@ -9,10 +9,12 @@
 #include <sensor_msgs/NavSatFix.h>
 #include <gps_common/conversions.h>
 #include <nav_msgs/Odometry.h>
+#include <tf/transform_broadcaster.h>
 
 using namespace gps_common;
 
 static ros::Publisher odom_pub;
+static tf::TransformBroadcaster odom_broadcaster;
 std::string frame_id, child_frame_id;
 double rot_cov;
 
@@ -28,6 +30,7 @@ void callback(const sensor_msgs::NavSatFixConstPtr& fix) {
 
   double northing, easting;
   std::string zone;
+
 
   LLtoUTM(fix->latitude, fix->longitude, northing, easting, zone);
 
@@ -73,6 +76,17 @@ void callback(const sensor_msgs::NavSatFixConstPtr& fix) {
     odom.pose.covariance = covariance;
 
     odom_pub.publish(odom);
+
+//    geometry_msgs::TransformStamped odom_trans;
+//    odom_trans.header.stamp = odom.header.stamp;
+//    odom_trans.header.frame_id = frame_id;
+//    odom_trans.child_frame_id = child_frame_id;
+//    odom_trans.transform.translation.x = odom.pose.pose.position.x;
+//    odom_trans.transform.translation.y = odom.pose.pose.position.y;
+//    odom_trans.transform.translation.z = odom.pose.pose.position.z;
+
+
+//    odom_broadcaster.sendTransform(odom_trans);
   }
 }
 

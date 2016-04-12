@@ -8,7 +8,10 @@ project(gpsd_client CXX)
 find_package(catkin REQUIRED
   roscpp
   gps_common
+  std_msgs
+  nav_msgs
   sensor_msgs
+  tf
 )
 
 find_package(PkgConfig)

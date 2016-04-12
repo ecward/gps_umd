@@ -5,12 +5,27 @@
 #include <sensor_msgs/NavSatStatus.h>
 #include <libgpsmm.h>
 
+
+#include <gps_common/conversions.h>
+#include <nav_msgs/Odometry.h>
+#include <tf/transform_broadcaster.h>
+
+
+/**
+ * NavSatFix messages do not include measured speed and course (angle relative to true north) which IS
+ * supported by many GPS units (e.g. trimble)
+ */
+
 using namespace gps_common;
 using namespace sensor_msgs;
 
+static ros::Publisher odom_pub;
+static tf::TransformBroadcaster * odom_broadcaster;
+std::string frame_id, child_frame_id;
+
 class GPSDClient {
   public:
-    GPSDClient() : privnode("~"), gps(NULL), use_gps_time(true), check_fix_by_variance(true) {}
+    GPSDClient() : privnode("~"), gps(NULL), use_gps_time(true), check_fix_by_variance(true),last_OK_course(0.0) {}
 
     bool start() {
       gps_fix_pub = node.advertise<GPSFix>("extended_fix", 1);
@@ -53,12 +68,23 @@ class GPSDClient {
 
     void step() {
 #if GPSD_API_MAJOR_VERSION >= 5
-      if (!gps->waiting(1e6))
-        return;
+      if (!gps->waiting(1e6)) {
+          ROS_INFO_STREAM("Gps->waiting!");
+          return;
+      }
 
       gps_data_t *p = gps->read();
+      ROS_INFO_STREAM("gps->read");
+
+      ROS_INFO_STREAM("gps->online = " << (p->online ? "true":"false") << " gps->fix->lat, lon "<<p->fix.latitude << ", " << p->fix.longitude);
+
+      //#define STATUS_NO_FIX	0	/* no */
+      //#define STATUS_FIX	1	/* yes, without DGPS */
+      //#define STATUS_DGPS_FIX	2	/* yes, with DGPS */
+      ROS_INFO_STREAM("gps->status = " << p->status << " (0-NO_FIX, 1-FIX W/O DGPS, 2-FIX DGPS)" );
 #else
       gps_data_t *p = gps->poll();
+      ROS_INFO_STREAM("gps->poll");
 #endif
       process_data(p);
     }
@@ -76,6 +102,8 @@ class GPSDClient {
 
     bool use_gps_time;
     bool check_fix_by_variance;
+
+    double last_OK_course;
 
     void process_data(struct gps_data_t* p) {
       if (p == NULL)
@@ -103,8 +131,11 @@ class GPSDClient {
       GPSFix fix;
       GPSStatus status;
 
+      //could change to use
+      //p->fix.time; instead of rostime::now
       status.header.stamp = time;
       fix.header.stamp = time;
+      fix.header.frame_id = child_frame_id;
 
       status.satellites_used = p->satellites_used;
 
@@ -127,6 +158,9 @@ class GPSDClient {
         status.satellite_visible_snr[i] = p->ss[i];
       }
 
+      ROS_INFO_STREAM("p->fix.track = " << p->fix.track ); //this sucks unless we are moving!
+      ROS_INFO_STREAM("p->fix.speed = " << p->fix.speed); //this also
+      ROS_INFO_STREAM("p->fix.epx = " << p->fix.epx);
       if ((p->status & STATUS_FIX) && !(check_fix_by_variance && isnan(p->fix.epx))) {
         status.status = 0; // FIXME: gpsmm puts its constants in the global
                            // namespace, so `GPSStatus::STATUS_FIX' is illegal.
@@ -170,7 +204,93 @@ class GPSDClient {
 
       fix.status = status;
 
-      gps_fix_pub.publish(fix);
+      ROS_INFO_STREAM("Publishing on /extended_fix !");
+      if(!isnan(fix.latitude) && !isnan(fix.longitude))
+          gps_fix_pub.publish(fix);
+
+      //Do conversion to UTM here, and publish nav_msgs::Odometry and TF
+      ///TODO should use the same conversion code for everything... (to avoid strange bugs)
+      double northing, easting;
+      std::string zone;
+      LLtoUTM(fix.latitude, fix.longitude, northing, easting, zone);
+
+
+
+      if (odom_pub) {
+        nav_msgs::Odometry odom;
+        odom.header.stamp = fix.header.stamp;
+
+        if (frame_id.empty())
+          odom.header.frame_id = fix.header.frame_id;
+        else
+          odom.header.frame_id = frame_id;
+
+        odom.child_frame_id = child_frame_id;
+
+        odom.pose.pose.position.x = easting;
+        odom.pose.pose.position.y = northing;
+        odom.pose.pose.position.z = fix.altitude;
+
+        /* Course made good (relative to true north) */
+
+        //angle in degrees, clockwise from north, we want angle in radians counter-clockwise from east
+        double courseTrueNorthDeg = p->fix.track;
+        if(!isnan(courseTrueNorthDeg)) {
+            last_OK_course = courseTrueNorthDeg;
+        }
+        double yaw = M_PI/180.0*(90-last_OK_course);
+
+        tf::Quaternion q = tf::createQuaternionFromRPY(0.0,0.0,yaw);
+
+        odom.pose.pose.orientation.x = q.x();
+        odom.pose.pose.orientation.y = q.y();
+        odom.pose.pose.orientation.z = q.z();
+        odom.pose.pose.orientation.w = q.w();
+
+        // Use ENU covariance to build XYZRPY covariance
+        double rot_cov = 999; ///TODO
+
+        //this can't be correct... should map this through lon,lat -> utm conversion...
+        boost::array<double, 36> covariance = {{
+          fix.position_covariance[0],
+          fix.position_covariance[1],
+          fix.position_covariance[2],
+          0, 0, 0,
+          fix.position_covariance[3],
+          fix.position_covariance[4],
+          fix.position_covariance[5],
+          0, 0, 0,
+          fix.position_covariance[6],
+          fix.position_covariance[7],
+          fix.position_covariance[8],
+          0, 0, 0,
+          0, 0, 0, rot_cov, 0, 0,
+          0, 0, 0, 0, rot_cov, 0,
+          0, 0, 0, 0, 0, rot_cov
+        }};
+        odom.pose.covariance = covariance;
+
+
+
+        geometry_msgs::TransformStamped odom_trans;
+        odom_trans.header.stamp = odom.header.stamp;
+        odom_trans.header.frame_id = frame_id;
+        odom_trans.child_frame_id = child_frame_id;
+        odom_trans.transform.translation.x = odom.pose.pose.position.x;
+        odom_trans.transform.translation.y = odom.pose.pose.position.y;
+        odom_trans.transform.translation.z = odom.pose.pose.position.z;
+        odom_trans.transform.rotation.x = q.x();
+        odom_trans.transform.rotation.y = q.y();
+        odom_trans.transform.rotation.z = q.z();
+        odom_trans.transform.rotation.w = q.w();
+
+
+        if( !isnan(easting) && !isnan(northing) && !isnan(fix.altitude) ) {
+            odom_pub.publish(odom);
+            odom_broadcaster->sendTransform(odom_trans);
+        }
+      }
+
     }
 
     void process_data_navsat(struct gps_data_t* p) {
@@ -182,6 +302,8 @@ class GPSDClient {
         fix->header.stamp = ros::Time(p->fix.time);
       else
         fix->header.stamp = ros::Time::now();
+
+      fix->header.frame_id = child_frame_id;
 
       /* gpsmm pollutes the global namespace with STATUS_,
        * so we need to use the ROS message's integer values
@@ -219,12 +341,21 @@ class GPSDClient {
 
       fix->position_covariance_type = NavSatFix::COVARIANCE_TYPE_DIAGONAL_KNOWN;
 
-      navsat_fix_pub.publish(fix);
+      if(!isnan(fix->latitude) && !isnan(fix->longitude))
+          navsat_fix_pub.publish(fix);
     }
 };
 
 int main(int argc, char ** argv) {
   ros::init(argc, argv, "gpsd_client");
+  ros::NodeHandle node;
+  ros::NodeHandle priv_node("~");
+
+  priv_node.param<std::string>("frame_id", frame_id, "");
+  priv_node.param<std::string>("child_frame_id", child_frame_id, "");
+  odom_pub = node.advertise<nav_msgs::Odometry>("odom", 10);
+  tf::TransformBroadcaster tfBC;
+  odom_broadcaster = &tfBC;
 
   GPSDClient client;
 
